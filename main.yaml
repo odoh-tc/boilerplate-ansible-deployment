@@ -1,0 +1,332 @@
+- name: Automated Deployment and Configuration for Boilerplate
+  hosts: hng
+  become: yes
+  become_method: sudo
+
+  vars:
+    app_name: stage_5b
+    app_repo: https://github.com/hngprojects/hng_boilerplate_java_web.git
+    app_dir: /opt/stage_5b
+    user: hng
+    pg_password: your_password
+    pg_user: admin
+    pg_db: app_db
+    app_port: 3000
+    nginx_port: 80
+    log_dir: /var/log/stage_5b
+    error_log: error.log
+    out_log: out.log
+    sha512_string: 053a16189928abd504a5ad686b30ddb9a6b171a3e13fe9b53148e7ffd7284c37d8ae74b87ad93449293b2d8b70437bf5ea53633df49ddefedc0d8847758fa37f
+    nginx_version: 1.26.0-1~{{ ansible_distribution_release }}
+    rabbitmq_user: guest
+    rabbitmq_password: guest
+    rabbitmq_email_queue_name: email_queue
+
+  pre_tasks:
+    - name: Install community.postgresql collection
+      command: ansible-galaxy collection install community.postgresql
+      changed_when: false
+
+  tasks:
+    - name: Ensure correct permissions on temporary directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "1777"
+      loop:
+        - /tmp
+        - /var/tmp
+        - /tmp/.ansible-ubuntu/tmp
+
+    - name: Ensure APT is up to date
+      apt:
+        update_cache: yes
+        upgrade: dist
+      register: apt_update
+      retries: 5
+      delay: 10
+      until: apt_update is succeeded
+
+    - name: Ensure universe repository is enabled
+      apt_repository:
+        repo: "deb http://archive.ubuntu.com/ubuntu {{ ansible_distribution_release }} universe"
+        state: present
+
+    - name: Update package lists
+      apt:
+        update_cache: yes
+
+    - name: Install git
+      apt:
+        name: git
+        state: present
+        update_cache: yes
+
+    - name: Create hng user with sudo privileges
+      user:
+        name: "{{ user }}"
+        shell: /bin/bash
+        groups: sudo
+        append: yes
+        createhome: yes
+
+    - name: Create necessary directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0755"
+      loop:
+        - "{{ app_dir }}"
+        - "{{ log_dir }}"
+        - /var/secrets
+
+    - name: Ensure the app directory is owned by hng user
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0755"
+
+    - name: Add app directory to Git safe directories
+      community.general.git_config:
+        name: safe.directory
+        scope: global
+        value: "{{ app_dir }}"
+
+    - name: Clone the boilerplate repository
+      git:
+        repo: "{{ app_repo }}"
+        dest: "{{ app_dir }}"
+        version: devops
+        force: yes
+
+    - name: Ensure the repository is owned by hng user
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        recurse: yes
+
+    - name: Install required packages
+      apt:
+        name: "{{ item }}"
+        update_cache: yes
+      loop:
+        - postgresql
+        - libpq-dev
+        - rabbitmq-server
+        - default-jdk
+        - maven
+        - python3-psycopg2
+
+    - name: Ensure PostgreSQL is running
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Set PostgreSQL password using shell command
+      shell: |
+        sudo -u postgres psql -c "ALTER USER postgres PASSWORD '{{ pg_password }}';"
+      environment:
+        PGDATA: "/var/lib/postgresql/data"
+
+    - name: Check if PostgreSQL user exists
+      shell: |
+        sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ pg_user }}';"
+      register: user_exists
+      failed_when: user_exists.rc != 0 and user_exists.stdout != "1"
+      changed_when: false
+
+    - name: Create PostgreSQL user
+      shell: |
+        sudo -u postgres psql -c "CREATE USER {{ pg_user }} WITH PASSWORD '{{ pg_password }}';"
+      environment:
+        PGDATA: "/var/lib/postgresql/data"
+      when: user_exists.stdout != "1"
+
+    - name: Check if PostgreSQL database exists
+      shell: |
+        sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ pg_db }}';"
+      register: db_exists
+      failed_when: db_exists.rc != 0 and db_exists.stdout != "1"
+      changed_when: false
+
+    - name: Create PostgreSQL database
+      shell: |
+        sudo -u postgres psql -c "CREATE DATABASE {{ pg_db }} OWNER {{ pg_user }};"
+      environment:
+        PGDATA: "/var/lib/postgresql/data"
+      when: db_exists.stdout != "1"
+
+    - name: Ensure RabbitMQ is running
+      systemd:
+        name: rabbitmq-server
+        state: started
+        enabled: yes
+
+    - name: Setup environment variables
+      lineinfile:
+        path: "{{ app_dir }}/.env"
+        create: yes
+        line: "{{ item }}"
+      loop:
+        - "DATABASE_URL=postgresql://{{ pg_user }}:{{ pg_password }}@localhost:5432/{{ pg_db }}"
+        - "QUEUE_URL=amqp://localhost"
+        - "SHA512_STRING={{ sha512_string }}"
+
+    - name: Create application properties file
+      copy:
+        dest: "{{ app_dir }}/src/main/resources/application.properties"
+        content: |
+          server.port={{ app_port }}
+          spring.datasource.url=jdbc:postgresql://localhost:5432/{{ pg_db }}
+          spring.datasource.username={{ pg_user }}
+          spring.datasource.password={{ pg_password }}
+          spring.datasource.driver-class-name=org.postgresql.Driver
+          spring.jpa.hibernate.ddl-auto=update
+          spring.jpa.show-sql=true
+          logging.level.org.springframework.web=INFO
+          logging.file.name={{ log_dir }}/app.log
+          security.basic.enabled=false
+          management.endpoints.web.exposure.include=*
+          spring.rabbitmq.host=localhost
+          spring.rabbitmq.port=5672
+          spring.rabbitmq.username={{ rabbitmq_user }}
+          spring.rabbitmq.password={{ rabbitmq_password }}
+          rabbitmq.queue.email={{ rabbitmq_email_queue_name }}
+          sha512.string={{ sha512_string }}
+          spring.mail.host=smtp.example.com
+          spring.mail.port=587
+          spring.mail.username=your_username
+          spring.mail.password=your_password
+          spring.mail.properties.mail.smtp.auth=true
+          spring.mail.properties.mail.smtp.starttls.enable=true
+
+    - name: Set ownership and permissions for application properties file
+      file:
+        path: "{{ app_dir }}/src/main/resources/application.properties"
+        owner: "{{ user }}"
+        group: "{{ user }}"
+        mode: "0644"
+
+    - name: Build the Java application
+      shell: |
+        sudo -u {{ user }} bash -c 'cd {{ app_dir }} && ./mvnw clean install -DskipTests'
+      environment:
+        MAVEN_OPTS: "-Xmx2048m"
+      register: maven_build
+      failed_when: maven_build.rc != 0
+
+    - name: Ensure the jar file exists
+      stat:
+        path: "{{ app_dir }}/target/hng-java-boilerplate-0.0.1-SNAPSHOT.jar"
+      register: jar_file
+
+    - name: Fail if jar file does not exist
+      fail:
+        msg: "The jar file was not built successfully."
+      when: not jar_file.stat.exists
+
+    - name: Configure the application service
+      copy:
+        dest: /etc/systemd/system/{{ app_name }}.service
+        content: |
+          [Unit]
+          Description={{ app_name }} service
+          After=network.target
+
+          [Service]
+          User={{ user }}
+          ExecStart=/usr/bin/java -jar {{ app_dir }}/target/hng-java-boilerplate-0.0.1-SNAPSHOT.jar
+          SuccessExitStatus=143
+          StandardOutput=file:{{ log_dir }}/{{ out_log }}
+          StandardError=file:{{ log_dir }}/{{ error_log }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload Systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start the application service
+      systemd:
+        name: "{{ app_name }}"
+        state: started
+        enabled: yes
+
+    - name: Add Nginx public key
+      apt_key:
+        url: https://nginx.org/keys/nginx_signing.key
+        state: present
+
+    - name: Add official Nginx repository
+      apt_repository:
+        repo: "deb http://nginx.org/packages/ubuntu/ {{ ansible_distribution_release }} nginx"
+        state: present
+
+    - name: Update package lists
+      apt:
+        update_cache: yes
+
+    - name: Install Nginx 1.26
+      apt:
+        name: "nginx={{ nginx_version }}"
+        state: present
+
+    - name: Create Nginx sites-available directory
+      file:
+        path: /etc/nginx/sites-available
+        state: directory
+
+    - name: Create Nginx sites-enabled directory
+      file:
+        path: /etc/nginx/sites-enabled
+        state: directory
+
+    - name: Create Nginx configuration file
+      template:
+        src: nginx_template.conf.j2
+        dest: /etc/nginx/sites-available/{{ app_name }}
+
+    - name: Ensure the Nginx configuration file is owned by root
+      file:
+        path: /etc/nginx/sites-available/{{ app_name }}
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Create symlink to enable the site
+      file:
+        src: /etc/nginx/sites-available/{{ app_name }}
+        dest: /etc/nginx/sites-enabled/{{ app_name }}
+        state: link
+
+    - name: Remove default server block configuration
+      file:
+        path: /etc/nginx/conf.d/default.conf
+        state: absent
+
+    - name: Enable and start Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+  handlers:
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+  post_tasks:
+    - name: Report successful deployment
+      debug:
+        msg: "The application has been successfully deployed and is running."
