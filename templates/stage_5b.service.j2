@@ -1,0 +1,13 @@
+[Unit]
+Description=Java Spring Boot Application
+After=network.target
+
+[Service]
+User={{ user }}
+WorkingDirectory={{ app_directory }}
+ExecStart={{ app_directory }}/mvnw spring-boot:run
+StandardOutput=file://{{ out_log }}
+StandardError=file://{{ error_log }}
+
+[Install]
+WantedBy=multi-user.target

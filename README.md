@@ -21,20 +21,10 @@ This project involves the automated deployment and configuration of a Java boile
 ## Directory Structure
 
 - `main.yaml`: Main Ansible playbook for deployment.
-- `nginx_template.conf.j2`: Jinja2 template for Nginx configuration.
 
 ## Inventory File
 
 The Ansible playbook requires an inventory file to specify the target host.
-
-### Example Inventory File
-
-Create an `inventory.cfg` file with the following content:
-
-```ini
-[hng]
-<YOUR_SERVER_IP> ansible_user=ubuntu ansible_ssh_private_key_file=<PATH_TO_YOUR_PRIVATE_KEY> ansible_python_interpreter=/usr/bin/python3.12
-```
 
 ## Running the Playbook
 
